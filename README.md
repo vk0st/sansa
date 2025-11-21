@@ -1,9 +1,8 @@
-# SANSA: how to compute EASE on million item datasets
+# [SANSA: how to compute EASE on million item datasets](https://doi.org/10.1145/3604915.3608827)
 
 [![PyPI - Version](https://img.shields.io/pypi/v/sansa)](https://pypi.org/project/sansa/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/scalable-approximate-nonsymmetric-autoencoder/recommendation-systems-on-amazon-book)](https://paperswithcode.com/sota/recommendation-systems-on-amazon-book?p=scalable-approximate-nonsymmetric-autoencoder)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/scalable-approximate-nonsymmetric-autoencoder/collaborative-filtering-on-million-song)](https://paperswithcode.com/sota/collaborative-filtering-on-million-song?p=scalable-approximate-nonsymmetric-autoencoder)
+[![DOI](https://img.shields.io/badge/DOI-10.1145%2F3604915.3608827-blue)](https://doi.org/10.1145/3604915.3608827)
 
 Official implementation of scalable collaborative filtering model **SANSA**.
 
