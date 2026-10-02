@@ -5,7 +5,28 @@ import pytest
 import scipy.sparse as sp
 
 from sansa import CHOLMODGramianFactorizerConfig, ICFGramianFactorizerConfig
+from sansa.core._ops._csc_ops import substitute_columns
+from sansa.core._ops._inverse_ops import UMRExecution
 from sansa.core.factorizers import GramianFactorizer
+from sansa.core.inverters import UMRUnitLowerTriangleInverter, UMRUnitLowerTriangleInverterConfig
+
+
+def test_replacement_handles_empty_and_preserves_residual_dtype():
+    matrix = sp.eye(4, format="csc", dtype=np.float64)
+    empty = substitute_columns(matrix, np.array([], dtype=np.int64), matrix[:, :0], dtype=matrix.dtype)
+    np.testing.assert_array_equal(empty.data, matrix.data)
+    replacement = matrix[:, [1]].copy()
+    replacement.data[:] = 1.123456789
+    actual = substitute_columns(matrix, np.array([1]), replacement, dtype=np.float64)
+    assert actual.dtype == np.float64
+    assert actual.indices.dtype == np.int32
+    np.testing.assert_array_equal(actual[:, 1].data, replacement.data)
+    large = sp.csc_matrix(([1.0], [2**31], [0, 1]), shape=(2**31 + 1, 1))
+    actual = substitute_columns(large, np.array([0]), large, dtype=np.float64)
+    assert actual.indices.dtype == actual.indptr.dtype == np.int64
+    np.testing.assert_array_equal(actual.indices, large.indices)
+    with pytest.raises(ValueError, match="sorted"):
+        substitute_columns(matrix, np.array([2, 1]), matrix[:, [2, 1]])
 
 
 def test_panel_prescaling_matches_complete_gram():
@@ -21,6 +42,37 @@ def test_panel_prescaling_matches_complete_gram():
     inplace_scale_along_uncompressed_axis(expected, 1 / scale)
     _apply_icf_scaling(x, True)
     np.testing.assert_array_equal(x.data, expected.data)
+
+
+def test_cache_tracks_global_pruning_and_is_fit_local():
+    execution = UMRExecution()
+    system = sp.eye(20, format="csc")
+    inverse = sp.eye(20, format="csc", dtype=np.float32)
+    inverse[3, 0] = 0.0001
+    residual = execution.get_residual_matrix(system, inverse)
+    assert execution.get_residual_matrix(system, inverse) is residual
+    replacement = inverse[:, [1]].copy()
+    replacement[2, 0] = 0.5
+    inverse = execution.substitute_columns(inverse, np.array([1]), replacement)
+    execution.inplace_sparsify(inverse, 0.0525)
+    assert np.count_nonzero(execution.cache.dirty) == 2
+    np.testing.assert_array_equal(execution.get_residual_matrix(system, inverse).toarray(), (sp.eye(20) - system @ inverse).toarray())
+    assert UMRExecution().cache.matrix is None
+    execution.close()
+    assert execution.cache.matrix is None
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_cached_and_uncached_umr_agree(dtype):
+    rng = np.random.default_rng(77)
+    system = sp.csc_matrix(np.eye(24, dtype=dtype) + np.tril(rng.random((24, 24)), -1).astype(dtype) * 0.1)
+    results = []
+    for cache in (False, True):
+        inverter = UMRUnitLowerTriangleInverter(UMRUnitLowerTriangleInverterConfig(residual_cache=cache))
+        results.append(inverter.invert(system))
+        assert inverter.config.residual_cache == cache
+    for attr in ("data", "indices", "indptr"):
+        np.testing.assert_array_equal(getattr(results[0], attr), getattr(results[1], attr))
 
 
 def test_icf_keeps_discarded_candidate_diagonal_updates():
