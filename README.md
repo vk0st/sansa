@@ -29,6 +29,10 @@ SANSA is a scalable modification of [EASE](https://arxiv.org/abs/1905.03375), a 
 ### Watch our Miton AI Times meetup [presentation & demo (YouTube)](https://www.youtube.com/watch?v=uAoDLXqOY-s).
 
 ## Installation
+SANSA requires Python **>=3.10**, NumPy >=2.0.2, SciPy >=1.14.1,
+Numba >=0.65.1, scikit-sparse 0.5.x and native SuiteSparse **>=7.4**.
+See [prerequisites](#prerequisites) before installing.
+
 ```bash
 pip install sansa
 ```
@@ -62,6 +66,12 @@ With SuiteSparse path correctly specified, simply run
 pip install .
 ```
 in the root directory of this repository.
+
+For optional MKL products, install `pip install ".[mkl]"` and select
+`SANSAConfig(..., backend="mkl")`. This requires an available Intel MKL runtime
+(for example, `pip install mkl` on supported platforms). The backend applies to
+UMR and inference products; Gram construction uses SciPy. Unlike earlier versions,
+MKL is not selected automatically when installed. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Usage
 ### Configuration
@@ -108,6 +118,9 @@ inverter_config = UMRUnitLowerTriangleInverterConfig(
     finetune_steps=5,  # number of finetuning steps, targeting worst columns
 )
 ```
+Residual reuse is enabled by default. Set `residual_cache=False` for full
+recomputation. Products use SciPy unless the model config selects MKL.
+
 ### Training
 ```python
 from sansa import SANSA
@@ -142,13 +155,21 @@ X = ...  # input interactions -- scipy.sparse.csr_matrix (rows=users, columns=it
 # if mask_input=True, input items get score=0
 top_k_indices, top_k_scores = model.recommend(X, k=10, mask_input=True)  # np.ndarrays of shape (X.shape[0], k)
 ```
+Rows with fewer than `k` stored predictions are padded with item `-1` and score
+`-inf`; ignore these missing entries rather than indexing the catalog with them.
 #### 2. Low-level inference: forward pass
 ```python
 X = ...  # input interactions -- scipy.sparse.csr_matrix (rows=users, columns=items)
 
 # Forward pass
 scores = model.forward(X)  # scipy.sparse.csr_matrix of shape X.shape
+
+# Optional dense scores for a bounded batch
+scores = model.forward(X[:128], dense=True)  # np.ndarray
 ```
+Dense output uses a direct final MKL product when `backend="mkl"`.
+Choose batch size to fit memory; the training Gram, factor fill and residual
+can still be large.
 
 ## License
 Copyright 2023 Inspigroup s.r.o.

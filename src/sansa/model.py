@@ -1,6 +1,8 @@
+import importlib
 import logging
 import warnings
 from dataclasses import dataclass
+from functools import partial
 from typing import Tuple
 
 import numpy as np
@@ -28,20 +30,28 @@ logging.basicConfig(level=logging.INFO)
 def _apply_icf_scaling(X: sp.csr_matrix, compute_gramian: bool) -> None:
     if compute_gramian:
         # Inplace scale columns of X by square roots of column norms of X^TX.
-        logger.info(f"Computing column norms of X^TX...")
-        da = np.sqrt(np.sqrt(get_squared_norms_along_compressed_axis(matmat(X.T, X))))
+        logger.info("Computing column norms of X^TX...")
+        norms = np.empty(X.shape[1], dtype=np.float64)
+        xt = X.T
+        panel_size = 256  # Limit the temporary Gram to this many columns.
+        for start in range(0, X.shape[1], panel_size):
+            stop = min(start + panel_size, X.shape[1])
+            gram = matmat(xt, X[:, start:stop]).tocsc()
+            norms[start:stop] = get_squared_norms_along_compressed_axis(gram)
+            del gram
+        da = np.sqrt(np.sqrt(norms))
         # Divide columns of X by the computed square roots of row norms of X^TX
         da[da == 0] = 1  # ignore zero elements
-        logger.info(f"Scaling columns of X by computed norms...")
+        logger.info("Scaling columns of X by computed norms...")
         inplace_scale_along_uncompressed_axis(X, 1 / da)  # CSR column scaling
         del da
     else:
         # Inplace scale rows and columns of X by square roots of row norms of X.
-        logger.info(f"Computing row norms of X...")
+        logger.info("Computing row norms of X...")
         da = np.sqrt(np.sqrt(get_squared_norms_along_compressed_axis(X)))
         # Divide rows and columns of X by the computed square roots of row norms of X
         da[da == 0] = 1  # ignore zero elements
-        logger.info(f"Scaling rows and columns of X by computed norms...")
+        logger.info("Scaling rows and columns of X by computed norms...")
         inplace_scale_along_uncompressed_axis(X, 1 / da)  # CSR column scaling
         inplace_scale_along_compressed_axis(X, 1 / da)  # CSR row scaling
         del da
@@ -53,6 +63,11 @@ class SANSAConfig:
     weight_matrix_density: float
     gramian_factorizer_config: GramianFactorizerConfig
     lower_triangle_inverter_config: UnitLowerTriangleInverterConfig
+    backend: str = "scipy"
+
+    def __post_init__(self) -> None:
+        if self.backend not in ("scipy", "mkl"):
+            raise ValueError("backend must be scipy or mkl")
 
 
 class SANSA:
@@ -62,6 +77,12 @@ class SANSA:
         self.factorizer = GramianFactorizer.from_config(config.gramian_factorizer_config)
         self.factorization_method = config.gramian_factorizer_config.factorization_method
         self.inverter = UnitLowerTriangleInverter.from_config(config.lower_triangle_inverter_config)
+        self.backend = config.backend
+        self.matmat = partial(matmat, backend=self.backend)
+        if self.backend == "mkl":
+            # Fail at construction if the explicitly requested backend is unavailable.
+            importlib.import_module("sparse_dot_mkl")
+        self.inverter.matmat = self.matmat
         self.weights = (None, None)
 
     @property
@@ -71,6 +92,7 @@ class SANSA:
             self.weight_matrix_density,
             self.factorizer.config,
             self.inverter.config,
+            self.backend,
         )
 
     def load_weights(self, weights: Tuple[sp.csr_matrix, sp.csr_matrix]) -> "SANSA":
@@ -133,31 +155,28 @@ class SANSA:
 
         return self
 
-    def forward(self, X: sp.csr_matrix) -> sp.csr_matrix:
+    def forward(self, X: sp.csr_matrix, dense: bool = False) -> sp.csr_matrix | np.ndarray:
         """
-        Forward pass.
+        Forward pass; dense=True avoids a sparse final product with MKL.
+        Pass a bounded user batch: dense output has users * items entries.
         """
-        latent = X @ self.weights[0]
-        out = latent @ self.weights[1]
-        return out
+        if any(weight is None for weight in self.weights):
+            raise RuntimeError("Call fit or load_weights before forward")
+        if X.shape[1] != self.weights[0].shape[0]:
+            raise ValueError("Input item dimension must match the model weights")
+        latent = self.matmat(X, self.weights[0])
+        return self.matmat(latent, self.weights[1], dense=dense)
 
     def recommend(self, interactions: sp.csr_matrix, k: int, mask_input: bool) -> Tuple[np.ndarray, np.ndarray]:
         """
         Recommend top k items for a batch of users given as a CSR matrix.
-        Fails with "kth out of bounds" error if for some user the model can't recommend k items (=model is too sparse).
+        If fewer than k stored predictions are available, pad with item -1 and score -inf.
+        Input masking retains its existing zero-score behavior.
         """
-        n_users = interactions.shape[0]
         predictions = self.forward(interactions)
         if mask_input:
             with warnings.catch_warnings():  # ignore warning about changing sparsity pattern
                 warnings.simplefilter("ignore")
                 predictions[interactions.nonzero()] = 0
 
-        # Get indices of top k items for each user and corresponding scores
-        top_k_ids, top_k_scores = top_k_along_compressed_axis(predictions, k)
-        # sort top_k_idx matrix and top_k_scores matrix
-        sorting = np.argsort(-top_k_scores, axis=1)
-        top_k_ids = top_k_ids[np.arange(n_users)[:, np.newaxis], sorting]
-        top_k_scores = top_k_scores[np.arange(n_users)[:, np.newaxis], sorting]
-
-        return top_k_ids, top_k_scores
+        return top_k_along_compressed_axis(predictions, k)
