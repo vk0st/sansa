@@ -8,6 +8,37 @@ from sansa import CHOLMODGramianFactorizerConfig, ICFGramianFactorizerConfig
 from sansa.core.factorizers import GramianFactorizer
 
 
+def test_panel_prescaling_matches_complete_gram():
+    from sansa.model import _apply_icf_scaling
+    from sansa.utils import get_squared_norms_along_compressed_axis, inplace_scale_along_uncompressed_axis
+
+    rng = np.random.default_rng(77)
+    x = sp.random(16, 260, density=0.1, format="csr", dtype=np.float32, random_state=rng)
+    expected = x.copy()
+    norms = get_squared_norms_along_compressed_axis((x.T @ x).tocsc())
+    scale = np.sqrt(np.sqrt(norms))
+    scale[scale == 0] = 1
+    inplace_scale_along_uncompressed_axis(expected, 1 / scale)
+    _apply_icf_scaling(x, True)
+    np.testing.assert_array_equal(x.data, expected.data)
+
+
+def test_icf_keeps_discarded_candidate_diagonal_updates():
+    from sansa.core._ops._factor_ops import icf
+
+    # Row 1 is dropped from column 0, but its square must still reduce the next pivot.
+    matrix = sp.csc_matrix([[9, 1, 2, 3], [1, 9, 0, 0], [2, 0, 9, 0], [3, 0, 0, 9]], dtype=np.float32)
+    with pytest.raises(ValueError, match="2\\*n"):
+        icf(sp.csc_matrix([[4, 1], [1, 4]], dtype=np.float32), l2=0.0, max_nnz=2)
+    expected = np.sqrt(np.float32(9) - (np.float32(1) / np.float32(3)) ** 2)
+    for dtype in (np.int32, np.int64):
+        matrix.indices = matrix.indices.astype(dtype)
+        matrix.indptr = matrix.indptr.astype(dtype)
+        factor = icf(matrix, l2=0.0, max_nnz=8)
+        np.testing.assert_array_equal(factor.indices[:factor.indptr[1]], [0, 2, 3])
+        assert factor.diagonal()[1] == expected
+
+
 @pytest.mark.parametrize("gramian", [False, True])
 def test_modern_cholmod_owned_factor_and_long_indices(gramian):
     x = sp.csr_matrix(np.array([[1, 0, 1], [0, 1, 1], [1, 1, 0], [0, 0, 1]], dtype=np.float32))

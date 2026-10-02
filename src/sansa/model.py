@@ -28,20 +28,28 @@ logging.basicConfig(level=logging.INFO)
 def _apply_icf_scaling(X: sp.csr_matrix, compute_gramian: bool) -> None:
     if compute_gramian:
         # Inplace scale columns of X by square roots of column norms of X^TX.
-        logger.info(f"Computing column norms of X^TX...")
-        da = np.sqrt(np.sqrt(get_squared_norms_along_compressed_axis(matmat(X.T, X))))
+        logger.info("Computing column norms of X^TX...")
+        norms = np.empty(X.shape[1], dtype=np.float64)
+        xt = X.T
+        panel_size = 256  # Limit the temporary Gram to this many columns.
+        for start in range(0, X.shape[1], panel_size):
+            stop = min(start + panel_size, X.shape[1])
+            gram = matmat(xt, X[:, start:stop]).tocsc()
+            norms[start:stop] = get_squared_norms_along_compressed_axis(gram)
+            del gram
+        da = np.sqrt(np.sqrt(norms))
         # Divide columns of X by the computed square roots of row norms of X^TX
         da[da == 0] = 1  # ignore zero elements
-        logger.info(f"Scaling columns of X by computed norms...")
+        logger.info("Scaling columns of X by computed norms...")
         inplace_scale_along_uncompressed_axis(X, 1 / da)  # CSR column scaling
         del da
     else:
         # Inplace scale rows and columns of X by square roots of row norms of X.
-        logger.info(f"Computing row norms of X...")
+        logger.info("Computing row norms of X...")
         da = np.sqrt(np.sqrt(get_squared_norms_along_compressed_axis(X)))
         # Divide rows and columns of X by the computed square roots of row norms of X
         da[da == 0] = 1  # ignore zero elements
-        logger.info(f"Scaling rows and columns of X by computed norms...")
+        logger.info("Scaling rows and columns of X by computed norms...")
         inplace_scale_along_uncompressed_axis(X, 1 / da)  # CSR column scaling
         inplace_scale_along_compressed_axis(X, 1 / da)  # CSR row scaling
         del da

@@ -153,7 +153,7 @@ class CHOLMODGramianFactorizer(GramianFactorizer):
         if desired_density <= 0.05:
             logger.warning(
                 f"""
-                For low desired desired ({desired_density:%}), computing exact factorization (CHOLMOD) 
+                For low desired density ({desired_density:%}), computing exact factorization (CHOLMOD)
                 followed by sparsification may be inefficient.
                 You may want to try {ICFGramianFactorizer.__name__} instead of {CHOLMODGramianFactorizer.__name__} 
                 (requires less memory and may be faster).
@@ -209,15 +209,6 @@ class ICFGramianFactorizer(GramianFactorizer):
             reordering_use_long=self.reordering_use_long,
             reordering_method=self.reordering_method,
         )
-
-    @staticmethod
-    def _index_dtypes_to_int64(A: sp.csc_matrix):
-        if not A.indptr.dtype == np.int64:
-            logger.info("Casting indptr of A to int64...")
-            A.indptr = A.indptr.astype(np.int64)
-        if not A.indices.dtype == np.int64:
-            logger.info("Casting indices of A to int64...")
-            A.indices = A.indices.astype(np.int64)
 
     @staticmethod
     def _suggest_cholmod_if_A_too_dense(A: sp.csc_matrix) -> None:
@@ -305,7 +296,6 @@ class ICFGramianFactorizer(GramianFactorizer):
         # 4. Prepare A for ICF algorithm
         logger.info("Sorting indices of A...")
         A.sort_indices()
-        self._index_dtypes_to_int64(A)
         gc.collect()
 
         # 5. Compute incomplete Cholesky factorization of A

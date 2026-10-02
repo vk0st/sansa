@@ -24,16 +24,16 @@ def icf(
     shift_step: float = 1e-3,
     shift_multiplier: float = 2.0,
 ) -> sp.csc_matrix:
+    """Compute incomplete Cholesky with max_nnz >= 2*n, matching the factorizer's minimum budget."""
     if isinstance(A, sp.csr_matrix):
         A = A.T
     if not isinstance(A, sp.csc_matrix):
         raise ValueError("Matrix A must be a scipy.sparse.csc_matrix")
     m, n = A.shape
     assert m == n, f"A must be square, got shape {A.shape}"
-    # need at least 1 element per column
-    # otherwise it doesn't make sense (mathematically, and the factorization algorithm would fail)
-    if max_nnz < n:
-        max_nnz = n
+    # Smaller budgets can leave a zero quota or overrun the pre-allocated kernel buffers.
+    if max_nnz < 2 * n:
+        raise ValueError("max_nnz must be at least 2*n")
     Lv = np.empty(max_nnz, dtype=np.float32)  # Values of non-zero elements of L
     Lr = np.empty(max_nnz, dtype=np.int64)  # Row indices of non-zero elements of L
     Lp = np.zeros(n + 1, dtype=np.int64)  # Start(Lp[i]) and end(Lp[i+1]) index of L[:, i] in Lv
@@ -51,7 +51,7 @@ def icf(
             Lr,
             Lp,
             max_nnz,
-            shift,
+            np.float32(shift),
         )
         # if shift is too small, increase it
         if nnz == -1:
@@ -68,17 +68,12 @@ def icf(
     return sp.csc_matrix((Lv, Lr, Lp), (n, n))
 
 
-# TODO delete signatures?
-@njit(
-    "int64(int64, float32[:], int64[:], int64[:], float32[:], int64[:], int64[:], int64, float32)",
-    cache=True,
-    nogil=True,
-)
+@njit(cache=True, nogil=True)
 def _core_icf(
     n: np.int64,
     Av: npt.NDArray[np.float32],
-    Ar: npt.NDArray[np.int64],
-    Ap: npt.NDArray[np.int64],
+    Ar: npt.NDArray[np.int32 | np.int64],
+    Ap: npt.NDArray[np.int32 | np.int64],
     Lv: npt.NDArray[np.float32],
     Lr: npt.NDArray[np.int64],
     Lp: npt.NDArray[np.int64],
@@ -88,26 +83,27 @@ def _core_icf(
     """
     Incomplete Cholesky Factorization algorithm -- numba just-in-time compiled core function.
     Computation is performed in-place in pre-allocated arrays Lv, Lr, Lp. Returns number of non-zero elements in L.
-    Input dtypes are critical and using the wrong dtypes will not work with compiled function!
+    Working values and output buffers use float32; row indices and column offsets use integer arrays.
     :param n: number of rows/columns of A
     :param Av: values of A -- A.data
-    :param Ar: row indices of A -- A.indices
-    :param Ap: start and end indices of columns of A -- A.indptr
+    :param Ar: row indices of A -- A.indices, int32 or int64
+    :param Ap: start and end indices of columns of A -- A.indptr, int32 or int64
     :param Lv: values of L -- L.data
     :param Lr: row indices of L -- L.indices
     :param Lp: start and end indices of columns of L -- L.indptr
     :param max_nnz: maximum number of non-zero elements in L
     :param shift: parameter of diagonal shift (to ensure positive-definiteness)
-    :return: number of non-zero elements in L
+    :return: number of non-zero elements in L, or -1 if a non-positive pivot is encountered
     """
     nnz = 0
     c_n = 0
     s = np.zeros(n, np.int64)  # Next non-zero row index i in column j of L
     t = np.zeros(n, np.int64)  # First subdiagonal index i in column j of A
-    l = np.zeros(n, np.int64) - 1  # Linked list of non-zero columns in row k of L
+    l = np.full(n, -1, np.int64)  # Linked list of non-zero columns in row k of L
     a = np.zeros(n, np.float32)  # Values of column j
     b = np.zeros(n, np.bool_)  # b[i] indicates if the i-th element of column j is non-zero
     c = np.empty(n, np.int64)  # Row indices of non-zero elements in column j
+    retained = np.empty(n, np.int64)  # Retained row indices, sorted before insertion into L
     d = np.full(n, shift, np.float32)  # Diagonal elements of A
 
     for j in range(n):
@@ -154,7 +150,7 @@ def _core_icf(
             return np.int64(-1)
 
         max_j_nnz = (max_nnz - nnz) // (n - j)  # Maximum num. of nnz elements in col j
-        # keep only min(c_n, max_j_nnz) largest values in a
+        # Keep only min(c_n, max_j_nnz) largest values in a.
         if c_n > max_j_nnz:
             cc = c[:c_n]
             aa = np.abs(a[cc])
@@ -168,17 +164,31 @@ def _core_icf(
         nnz += 1
         s[j] = nnz  # Set first non-zero index of column j
 
-        for i in np.sort(c[:c_n]):  # Sort row indices of column j for correct insertion order into L
-            L_ij = a[i] / d[j]  # Get non-zero element from sparse column j
-            d[i] -= L_ij * L_ij  # Update diagonal element L_ii
-            if b[i]:  # If element is not discarded and sufficiently non-zero
-                Lv[nnz] = L_ij  # Add element L_ij to L
-                Lr[nnz] = i  # Add row index of L_ij
-                nnz += 1
-            a[i] = 0.0  # Set element i in column j to zero
-            b[i] = False  # Mark element as zero
-        c_n = 0  # Discard row indices of non-zero elements in column j.
+        kept = 0
+        # Update the diagonal for every candidate, including discarded elements.
+        for pos in range(c_n):
+            i = c[pos]
+            L_ij = a[i] / d[j]
+            d[i] -= L_ij * L_ij
+            if b[i]:
+                retained[kept] = i
+                kept += 1
+
+        # Only retained rows need sorting for correct insertion order into L.
+        retained[:kept].sort()
+        for pos in range(kept):
+            i = retained[pos]
+            Lv[nnz] = a[i] / d[j]
+            Lr[nnz] = i
+            nnz += 1
+
+        for pos in range(c_n):
+            i = c[pos]
+            a[i] = 0.0
+            b[i] = False
+        c_n = 0  # Discard row indices of non-zero elements in column j
         Lp[j + 1] = nnz  # Update count of non-zero elements up to column j
+
         if Lp[j] + 1 < Lp[j + 1]:  # If column j has a non-zero element below diagonal
             i = Lr[Lp[j] + 1]  # Row index of first off-diagonal non-zero element
             l[j] = l[i]  # Remember old list i index in list j
