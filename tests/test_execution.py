@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from sansa import CHOLMODGramianFactorizerConfig, ICFGramianFactorizerConfig
+from sansa import CHOLMODGramianFactorizerConfig, ICFGramianFactorizerConfig, SANSA, SANSAConfig
 from sansa.core._ops._csc_ops import substitute_columns
 from sansa.core._ops._inverse_ops import UMRExecution
 from sansa.core.factorizers import GramianFactorizer
@@ -89,6 +89,40 @@ def test_icf_keeps_discarded_candidate_diagonal_updates():
         factor = icf(matrix, l2=0.0, max_nnz=8)
         np.testing.assert_array_equal(factor.indices[:factor.indptr[1]], [0, 2, 3])
         assert factor.diagonal()[1] == expected
+
+
+def test_optional_mkl_products_and_index_guard():
+    pytest.importorskip("sparse_dot_mkl")
+    import sparse_dot_mkl
+    from sansa.utils import matmat
+
+    x = sp.csr_matrix([[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    weights = sp.csr_matrix([[1.0, -0.4, 0.0], [0.1, 1.0, -0.2], [-0.3, 0.2, 1.0]], dtype=np.float64)
+    x.indices = x.indices.astype(np.int64)
+    x.indptr = x.indptr.astype(np.int64)
+    latent = matmat(x, weights, backend="mkl")
+    np.testing.assert_allclose(matmat(latent, weights, backend="mkl", dense=True), (x @ weights @ weights).toarray(), atol=1e-14)
+    assert x.indices.dtype == x.indptr.dtype == np.int64
+    if sparse_dot_mkl.mkl_interface_integer_dtype() == np.dtype(np.int32):
+        with pytest.raises(OverflowError):
+            matmat(sp.csc_matrix((2**31, 1)), sp.csc_matrix([[1.0]]), backend="mkl")
+
+
+@pytest.mark.parametrize("backend", ["scipy", "mkl"])
+def test_model_backend_forward(backend):
+    if backend == "mkl":
+        pytest.importorskip("sparse_dot_mkl")
+    config = SANSAConfig(2.0, 1.0, CHOLMODGramianFactorizerConfig(), UMRUnitLowerTriangleInverterConfig(), backend=backend)
+    model = SANSA(config)
+    x = sp.eye(3, format="csr", dtype=np.float32)
+    with pytest.raises(RuntimeError, match="fit"):
+        model.forward(x)
+    weights = sp.csr_matrix([[1.0, -0.4, 0.0], [0.1, 1.0, -0.2], [-0.3, 0.2, 1.0]], dtype=np.float64)
+    model.load_weights((weights, weights))
+    assert model.config == config
+    np.testing.assert_allclose(model.forward(x, dense=True), model.forward(x).toarray(), atol=1e-14)
+    with pytest.raises(ValueError, match="dimension"):
+        model.forward(sp.csr_matrix((2, 4)))
 
 
 @pytest.mark.parametrize("gramian", [False, True])

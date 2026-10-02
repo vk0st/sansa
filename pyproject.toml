@@ -48,6 +48,6 @@ Repository = "https://github.com/glami/sansa.git"
 Issues = "https://github.com/glami/sansa/issues"
 
 [project.optional-dependencies]
-mkl = ["sparse_dot_mkl"]
+mkl = ["sparse_dot_mkl >= 0.9.10"]
 dev = ["ruff", "pytest"]
 demo = ["jupyter", "matplotlib", "pandas", "pyarrow", "ipyplot", "scikit-learn"]

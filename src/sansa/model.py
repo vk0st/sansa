@@ -1,6 +1,8 @@
+import importlib
 import logging
 import warnings
 from dataclasses import dataclass
+from functools import partial
 from typing import Tuple
 
 import numpy as np
@@ -61,6 +63,11 @@ class SANSAConfig:
     weight_matrix_density: float
     gramian_factorizer_config: GramianFactorizerConfig
     lower_triangle_inverter_config: UnitLowerTriangleInverterConfig
+    backend: str = "scipy"
+
+    def __post_init__(self) -> None:
+        if self.backend not in ("scipy", "mkl"):
+            raise ValueError("backend must be scipy or mkl")
 
 
 class SANSA:
@@ -70,6 +77,12 @@ class SANSA:
         self.factorizer = GramianFactorizer.from_config(config.gramian_factorizer_config)
         self.factorization_method = config.gramian_factorizer_config.factorization_method
         self.inverter = UnitLowerTriangleInverter.from_config(config.lower_triangle_inverter_config)
+        self.backend = config.backend
+        self.matmat = partial(matmat, backend=self.backend)
+        if self.backend == "mkl":
+            # Fail at construction if the explicitly requested backend is unavailable.
+            importlib.import_module("sparse_dot_mkl")
+        self.inverter.matmat = self.matmat
         self.weights = (None, None)
 
     @property
@@ -79,6 +92,7 @@ class SANSA:
             self.weight_matrix_density,
             self.factorizer.config,
             self.inverter.config,
+            self.backend,
         )
 
     def load_weights(self, weights: Tuple[sp.csr_matrix, sp.csr_matrix]) -> "SANSA":
@@ -141,13 +155,17 @@ class SANSA:
 
         return self
 
-    def forward(self, X: sp.csr_matrix) -> sp.csr_matrix:
+    def forward(self, X: sp.csr_matrix, dense: bool = False) -> sp.csr_matrix | np.ndarray:
         """
-        Forward pass.
+        Forward pass; dense=True avoids a sparse final product with MKL.
+        Pass a bounded user batch: dense output has users * items entries.
         """
-        latent = X @ self.weights[0]
-        out = latent @ self.weights[1]
-        return out
+        if any(weight is None for weight in self.weights):
+            raise RuntimeError("Call fit or load_weights before forward")
+        if X.shape[1] != self.weights[0].shape[0]:
+            raise ValueError("Input item dimension must match the model weights")
+        latent = self.matmat(X, self.weights[0])
+        return self.matmat(latent, self.weights[1], dense=dense)
 
     def recommend(self, interactions: sp.csr_matrix, k: int, mask_input: bool) -> Tuple[np.ndarray, np.ndarray]:
         """
